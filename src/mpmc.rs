@@ -86,7 +86,7 @@
 //!
 //! [0]: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 
-use core::{cell::UnsafeCell, mem::MaybeUninit};
+use core::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicUsize};
 
 #[cfg(not(feature = "portable-atomic"))]
 use core::sync::atomic;
@@ -128,6 +128,7 @@ pub type Q64<T> = MpMcQueue<T, 64>;
 /// The max value of N is u8::MAX - 1 if `mpmc_large` feature is not enabled.
 pub struct MpMcQueue<T, const N: usize> {
     buffer: UnsafeCell<[Cell<T>; N]>,
+    len: AtomicUsize,
     dequeue_pos: AtomicTargetSize,
     enqueue_pos: AtomicTargetSize,
 }
@@ -158,28 +159,47 @@ impl<T, const N: usize> MpMcQueue<T, N> {
 
         Self {
             buffer: UnsafeCell::new(result_cells),
+            len: AtomicUsize::new(0),
             dequeue_pos: AtomicTargetSize::new(0),
             enqueue_pos: AtomicTargetSize::new(0),
         }
     }
 
+    /// Returns the numbers of elements in the queue 
+    pub fn len(&self) -> usize {
+        AtomicUsize::load(&self.len, Ordering::Relaxed)
+    }
+
     /// Returns the item in the front of the queue, or `None` if the queue is empty
     pub fn dequeue(&self) -> Option<T> {
-        unsafe { dequeue(self.buffer.get() as *mut _, &self.dequeue_pos, Self::MASK) }
+        let result = unsafe { dequeue(self.buffer.get() as *mut _, &self.dequeue_pos, Self::MASK) };
+
+        if result.is_some() {
+            AtomicUsize::fetch_sub(&self.len, 1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// Adds an `item` to the end of the queue
     ///
     /// Returns back the `item` if the queue is full
     pub fn enqueue(&self, item: T) -> Result<(), T> {
-        unsafe {
+        let result = unsafe {
             enqueue(
                 self.buffer.get() as *mut _,
                 &self.enqueue_pos,
                 Self::MASK,
                 item,
             )
+        };
+
+        // Increment count if we have inserted.
+        if result.is_ok() {
+            AtomicUsize::fetch_add(&self.len, 1, Ordering::Relaxed);
         }
+
+        result
     }
 }
 
@@ -296,7 +316,7 @@ unsafe fn enqueue<T>(
 mod tests {
     use static_assertions::assert_not_impl_any;
 
-    use super::{MpMcQueue, Q2};
+    use super::{MpMcQueue, Q2, Q32};
 
     // Ensure a `MpMcQueue` containing `!Send` values stays `!Send` itself.
     assert_not_impl_any!(MpMcQueue<*const (), 4>: Send);
@@ -305,12 +325,17 @@ mod tests {
     fn sanity() {
         let q = Q2::new();
         q.enqueue(0).unwrap();
+        assert_eq!(q.len(), 1);
         q.enqueue(1).unwrap();
+        assert_eq!(q.len(), 2);
         assert!(q.enqueue(2).is_err());
 
         assert_eq!(q.dequeue(), Some(0));
+        assert_eq!(q.len(), 1);
         assert_eq!(q.dequeue(), Some(1));
+        assert_eq!(q.len(), 0);
         assert_eq!(q.dequeue(), None);
+        assert_eq!(q.len(), 0);
     }
 
     #[test]
@@ -318,6 +343,7 @@ mod tests {
         let q = Q2::new();
         for _ in 0..255 {
             assert!(q.enqueue(0).is_ok());
+            assert_eq!(q.len(), 1);
             assert_eq!(q.dequeue(), Some(0));
         }
         // this should not block forever
@@ -329,11 +355,31 @@ mod tests {
         let q = Q2::new();
         for _ in 0..254 {
             assert!(q.enqueue(0).is_ok());
+            assert_eq!(q.len(), 1);
             assert_eq!(q.dequeue(), Some(0));
         }
         assert!(q.enqueue(0).is_ok());
+        assert_eq!(q.len(), 1);
         assert!(q.enqueue(0).is_ok());
+        assert_eq!(q.len(), 2);
         // this should not block forever
         assert!(q.enqueue(0).is_err());
+    }
+
+    #[test]
+    fn len_all_the_way() {
+        let q = Q32::new();
+
+        // Count all the way up.
+        for i in 0..32 {
+            assert_eq!(q.len(), i);
+            assert!(q.enqueue(0).is_ok());
+        }
+
+        // Count all the way down.
+        for i in 0..32 {
+            assert_eq!(q.len(), 32 - i);
+            assert_eq!(q.dequeue(), Some(0));
+        }
     }
 }
