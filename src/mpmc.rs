@@ -86,7 +86,7 @@
 //!
 //! [0]: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 
-use core::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicUsize};
+use core::{cell::UnsafeCell, mem::MaybeUninit};
 
 #[cfg(not(feature = "portable-atomic"))]
 use core::sync::atomic;
@@ -105,41 +105,41 @@ type IntSize = usize;
 #[cfg(not(feature = "mpmc_large"))]
 type IntSize = u8;
 
-/// MPMC queue with a capability for 2 elements.
+/// MPMC queue with a capability for (2-1) 1 elements.
 pub type Q2<T> = MpMcQueue<T, 2>;
 
-/// MPMC queue with a capability for 4 elements.
+/// MPMC queue with a capability for (4-1) 3 elements.
 pub type Q4<T> = MpMcQueue<T, 4>;
 
-/// MPMC queue with a capability for 8 elements.
+/// MPMC queue with a capability for (8-1) 7 elements.
 pub type Q8<T> = MpMcQueue<T, 8>;
 
-/// MPMC queue with a capability for 16 elements.
+/// MPMC queue with a capability for (16-1) 15 elements.
 pub type Q16<T> = MpMcQueue<T, 16>;
 
-/// MPMC queue with a capability for 32 elements.
+/// MPMC queue with a capability for (32-1) 31 elements.
 pub type Q32<T> = MpMcQueue<T, 32>;
 
-/// MPMC queue with a capability for 64 elements.
+/// MPMC queue with a capability for (64-1) 63 elements.
 pub type Q64<T> = MpMcQueue<T, 64>;
 
-/// MPMC queue with a capacity for N elements
+/// MPMC queue with a capacity for N-1 elements
 /// N must be a power of 2
 /// The max value of N is u8::MAX - 1 if `mpmc_large` feature is not enabled.
 pub struct MpMcQueue<T, const N: usize> {
     buffer: UnsafeCell<[Cell<T>; N]>,
-    len: AtomicUsize,
     dequeue_pos: AtomicTargetSize,
     enqueue_pos: AtomicTargetSize,
 }
 
 impl<T, const N: usize> MpMcQueue<T, N> {
     const MASK: IntSize = (N - 1) as IntSize;
-    const EMPTY_CELL: Cell<T> = Cell::new(0);
+    const EMPTY_CELL: Cell<T> = Cell::new();
 
     const ASSERT: [(); 1] = [()];
 
     /// Creates an empty queue
+    #[inline]
     pub const fn new() -> Self {
         // Const assert
         crate::sealed::greater_than_1::<N>();
@@ -153,53 +153,71 @@ impl<T, const N: usize> MpMcQueue<T, N> {
 
         let mut result_cells: [Cell<T>; N] = [Self::EMPTY_CELL; N];
         while cell_count != N {
-            result_cells[cell_count] = Cell::new(cell_count);
+            result_cells[cell_count] = Cell::new();
             cell_count += 1;
         }
 
         Self {
             buffer: UnsafeCell::new(result_cells),
-            len: AtomicUsize::new(0),
             dequeue_pos: AtomicTargetSize::new(0),
             enqueue_pos: AtomicTargetSize::new(0),
         }
     }
 
-    /// Returns the numbers of elements in the queue 
+    /// Returns the numbers of elements in the queue
+    #[inline]
     pub fn len(&self) -> usize {
-        AtomicUsize::load(&self.len, Ordering::Relaxed)
+        let front = self.enqueue_pos.load(Ordering::Relaxed);
+        let back = self.dequeue_pos.load(Ordering::Relaxed);
+
+        if front >= back {
+            (front - back) as usize
+        } else {
+            (N - (back - front) as usize) % N
+        }
+    }
+
+    /// Returns true if the queue contains N-1 elements.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.len() == N - 1
+    }
+
+    /// Returns true if the queue contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Returns the item in the front of the queue, or `None` if the queue is empty
+    #[inline]
     pub fn dequeue(&self) -> Option<T> {
-        let result = unsafe { dequeue(self.buffer.get() as *mut _, &self.dequeue_pos, Self::MASK) };
-
-        if result.is_some() {
-            AtomicUsize::fetch_sub(&self.len, 1, Ordering::Relaxed);
+        unsafe {
+            dequeue(
+                self.buffer.get() as *mut _,
+                &self.dequeue_pos,
+                Self::MASK,
+                N,
+                self.len(),
+            )
         }
-
-        result
     }
 
     /// Adds an `item` to the end of the queue
     ///
     /// Returns back the `item` if the queue is full
+    #[inline]
     pub fn enqueue(&self, item: T) -> Result<(), T> {
-        let result = unsafe {
+        unsafe {
             enqueue(
                 self.buffer.get() as *mut _,
                 &self.enqueue_pos,
                 Self::MASK,
                 item,
+                N,
+                self.len(),
             )
-        };
-
-        // Increment count if we have inserted.
-        if result.is_ok() {
-            AtomicUsize::fetch_add(&self.len, 1, Ordering::Relaxed);
         }
-
-        result
     }
 }
 
@@ -213,14 +231,12 @@ unsafe impl<T, const N: usize> Sync for MpMcQueue<T, N> where T: Send {}
 
 struct Cell<T> {
     data: MaybeUninit<T>,
-    sequence: AtomicTargetSize,
 }
 
 impl<T> Cell<T> {
-    const fn new(seq: usize) -> Self {
+    const fn new() -> Self {
         Self {
             data: MaybeUninit::uninit(),
-            sequence: AtomicTargetSize::new(seq as IntSize),
         }
     }
 }
@@ -229,42 +245,26 @@ unsafe fn dequeue<T>(
     buffer: *mut Cell<T>,
     dequeue_pos: &AtomicTargetSize,
     mask: IntSize,
+    capacity: usize,
+    len: usize,
 ) -> Option<T> {
-    let mut pos = dequeue_pos.load(Ordering::Relaxed);
+    // Loads the enqueue position from the atomic.
+    let pos = dequeue_pos.load(Ordering::Relaxed);
 
-    let mut cell;
-    loop {
-        cell = buffer.add(usize::from(pos & mask));
-        let seq = (*cell).sequence.load(Ordering::Acquire);
-        let dif = (seq as i8).wrapping_sub((pos.wrapping_add(1)) as i8);
-
-        match dif.cmp(&0) {
-            core::cmp::Ordering::Equal => {
-                if dequeue_pos
-                    .compare_exchange_weak(
-                        pos,
-                        pos.wrapping_add(1),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            core::cmp::Ordering::Less => {
-                return None;
-            }
-            core::cmp::Ordering::Greater => {
-                pos = dequeue_pos.load(Ordering::Relaxed);
-            }
-        }
+    // Check remaining items.
+    if len < 1 {
+        return None;
     }
 
+    let cell = buffer.add(usize::from(pos & mask));
+
+    dequeue_pos
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+            Some(((v + 1) as usize % (capacity)) as IntSize)
+        })
+        .unwrap();
+
     let data = (*cell).data.as_ptr().read();
-    (*cell)
-        .sequence
-        .store(pos.wrapping_add(mask).wrapping_add(1), Ordering::Release);
     Some(data)
 }
 
@@ -273,78 +273,75 @@ unsafe fn enqueue<T>(
     enqueue_pos: &AtomicTargetSize,
     mask: IntSize,
     item: T,
+    capacity: usize,
+    len: usize,
 ) -> Result<(), T> {
-    let mut pos = enqueue_pos.load(Ordering::Relaxed);
+    // Loads the enqueue position from the atomic.
+    let pos = enqueue_pos.load(Ordering::Relaxed);
 
-    let mut cell;
-    loop {
-        cell = buffer.add(usize::from(pos & mask));
-        let seq = (*cell).sequence.load(Ordering::Acquire);
-        let dif = (seq as i8).wrapping_sub(pos as i8);
-
-        match dif.cmp(&0) {
-            core::cmp::Ordering::Equal => {
-                if enqueue_pos
-                    .compare_exchange_weak(
-                        pos,
-                        pos.wrapping_add(1),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            core::cmp::Ordering::Less => {
-                return Err(item);
-            }
-            core::cmp::Ordering::Greater => {
-                pos = enqueue_pos.load(Ordering::Relaxed);
-            }
-        }
+    // Check remaining space.
+    if (capacity - len - 1) < 1 {
+        return Err(item);
     }
 
+    let cell = buffer.add(usize::from(pos & mask));
     (*cell).data.as_mut_ptr().write(item);
-    (*cell)
-        .sequence
-        .store(pos.wrapping_add(1), Ordering::Release);
-    Ok(())
+
+    enqueue_pos
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+            Some(((v + 1) as usize % (capacity)) as IntSize)
+        })
+        .unwrap();
+    return Ok(());
 }
 
 #[cfg(test)]
 mod tests {
     use static_assertions::assert_not_impl_any;
 
-    use super::{MpMcQueue, Q2, Q32};
+    use super::{MpMcQueue, Q32, Q4};
 
     // Ensure a `MpMcQueue` containing `!Send` values stays `!Send` itself.
     assert_not_impl_any!(MpMcQueue<*const (), 4>: Send);
 
     #[test]
     fn sanity() {
-        let q = Q2::new();
+        let q = Q4::new();
         q.enqueue(0).unwrap();
         assert_eq!(q.len(), 1);
         q.enqueue(1).unwrap();
         assert_eq!(q.len(), 2);
-        assert!(q.enqueue(2).is_err());
+        q.enqueue(2).unwrap();
+        assert_eq!(q.len(), 3);
+
+        assert!(q.is_full());
+        assert!(q.enqueue(1).is_err());
 
         assert_eq!(q.dequeue(), Some(0));
-        assert_eq!(q.len(), 1);
+        assert_eq!(q.len(), 2);
+        assert!(!q.is_full());
+
         assert_eq!(q.dequeue(), Some(1));
+        assert_eq!(q.len(), 1);
+        assert!(!q.is_full());
+
+        assert_eq!(q.dequeue(), Some(2));
         assert_eq!(q.len(), 0);
+        assert!(!q.is_full());
+
         assert_eq!(q.dequeue(), None);
         assert_eq!(q.len(), 0);
+        assert!(q.is_empty());
     }
 
     #[test]
     fn drain_at_pos255() {
-        let q = Q2::new();
+        let q = Q4::new();
         for _ in 0..255 {
             assert!(q.enqueue(0).is_ok());
             assert_eq!(q.len(), 1);
             assert_eq!(q.dequeue(), Some(0));
+            assert!(q.is_empty());
         }
         // this should not block forever
         assert_eq!(q.dequeue(), None);
@@ -352,16 +349,20 @@ mod tests {
 
     #[test]
     fn full_at_wrapped_pos0() {
-        let q = Q2::new();
+        let q = Q4::new();
         for _ in 0..254 {
             assert!(q.enqueue(0).is_ok());
             assert_eq!(q.len(), 1);
             assert_eq!(q.dequeue(), Some(0));
+            assert!(q.is_empty());
         }
         assert!(q.enqueue(0).is_ok());
         assert_eq!(q.len(), 1);
-        assert!(q.enqueue(0).is_ok());
+        assert!(q.enqueue(1).is_ok());
         assert_eq!(q.len(), 2);
+        assert!(q.enqueue(2).is_ok());
+        assert_eq!(q.len(), 3);
+        assert!(q.is_full());
         // this should not block forever
         assert!(q.enqueue(0).is_err());
     }
@@ -371,15 +372,17 @@ mod tests {
         let q = Q32::new();
 
         // Count all the way up.
-        for i in 0..32 {
+        for i in 0..31 {
             assert_eq!(q.len(), i);
-            assert!(q.enqueue(0).is_ok());
+            assert!(q.enqueue(i).is_ok());
         }
+        assert!(q.is_full());
 
         // Count all the way down.
-        for i in 0..32 {
-            assert_eq!(q.len(), 32 - i);
-            assert_eq!(q.dequeue(), Some(0));
+        for i in 0..31 {
+            assert_eq!(q.len(), 31 - i);
+            assert_eq!(q.dequeue(), Some(i));
         }
+        assert!(q.is_empty());
     }
 }
