@@ -96,6 +96,7 @@ pub use indexmap::{
 pub use indexset::{FnvIndexSet, IndexSet, Iter as IndexSetIter};
 pub use linear_map::LinearMap;
 pub use string::String;
+pub use array_string::ArrayString;
 
 // Workaround https://github.com/rust-lang/rust/issues/119015. This is required so that the methods on `VecView` and `Vec` are properly documented.
 // cfg(doc) prevents `VecInner` being part of the public API.
@@ -114,6 +115,7 @@ mod histbuf;
 mod indexmap;
 mod indexset;
 mod linear_map;
+pub mod array_string;
 pub mod string;
 mod vec;
 
@@ -170,4 +172,5 @@ mod sealed;
 #[doc(hidden)]
 pub mod _export {
     pub use crate::string::format;
+    pub use crate::array_string::format2;
 }
