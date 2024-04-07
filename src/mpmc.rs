@@ -133,9 +133,7 @@ pub struct MpMcQueue<T, const N: usize> {
 }
 
 impl<T, const N: usize> MpMcQueue<T, N> {
-    const MASK: IntSize = (N - 1) as IntSize;
     const EMPTY_CELL: Cell<T> = Cell::new();
-
     const ASSERT: [(); 1] = [()];
 
     /// Creates an empty queue
@@ -196,7 +194,6 @@ impl<T, const N: usize> MpMcQueue<T, N> {
             dequeue(
                 self.buffer.get() as *mut _,
                 &self.dequeue_pos,
-                Self::MASK,
                 N,
                 self.len(),
             )
@@ -212,7 +209,6 @@ impl<T, const N: usize> MpMcQueue<T, N> {
             enqueue(
                 self.buffer.get() as *mut _,
                 &self.enqueue_pos,
-                Self::MASK,
                 item,
                 N,
                 self.len(),
@@ -244,23 +240,20 @@ impl<T> Cell<T> {
 unsafe fn dequeue<T>(
     buffer: *mut Cell<T>,
     dequeue_pos: &AtomicTargetSize,
-    mask: IntSize,
     capacity: usize,
     len: usize,
 ) -> Option<T> {
-    // Loads the enqueue position from the atomic.
     let pos = dequeue_pos.load(Ordering::Relaxed);
 
-    // Check remaining items.
     if len < 1 {
         return None;
     }
 
-    let cell = buffer.add(usize::from(pos & mask));
+    let cell = buffer.add(usize::from(pos));
 
     dequeue_pos
         .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
-            Some(((v + 1) as usize % (capacity)) as IntSize)
+            Some((usize::from(v + 1) % capacity) as IntSize)
         })
         .unwrap();
 
@@ -271,7 +264,6 @@ unsafe fn dequeue<T>(
 unsafe fn enqueue<T>(
     buffer: *mut Cell<T>,
     enqueue_pos: &AtomicTargetSize,
-    mask: IntSize,
     item: T,
     capacity: usize,
     len: usize,
@@ -284,12 +276,12 @@ unsafe fn enqueue<T>(
         return Err(item);
     }
 
-    let cell = buffer.add(usize::from(pos & mask));
+    let cell = buffer.add(usize::from(pos));
     (*cell).data.as_mut_ptr().write(item);
 
     enqueue_pos
         .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
-            Some(((v + 1) as usize % (capacity)) as IntSize)
+            Some((usize::from(v + 1) % capacity) as IntSize)
         })
         .unwrap();
     return Ok(());
