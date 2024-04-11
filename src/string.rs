@@ -1,12 +1,7 @@
-//! A fixed capacity [`String`](https://doc.rust-lang.org/std/string/struct.String.html).
+//! A fixed capacity array backed [`String`](https://doc.rust-lang.org/std/string/struct.String.html).
 
 use core::{
-    char::DecodeUtf16Error,
-    cmp::Ordering,
-    fmt,
-    fmt::{Arguments, Write},
-    hash, iter, ops,
-    str::{self, Utf8Error},
+    char::DecodeUtf16Error, cmp::Ordering, fmt::{self, Arguments, Write}, hash, iter, ops, panic, str::{self, Utf8Error}
 };
 
 use crate::Vec;
@@ -35,8 +30,11 @@ impl fmt::Display for FromUtf16Error {
 
 /// A fixed capacity [`String`](https://doc.rust-lang.org/std/string/struct.String.html).
 pub struct String<const N: usize> {
-    vec: Vec<u8, N>,
+    arr: [u8; N],
+    len: usize,
 }
+
+impl<const N: usize> Copy for String<N> {}
 
 impl<const N: usize> String<N> {
     /// Constructs a new, empty `String` with a fixed capacity of `N` bytes.
@@ -56,7 +54,10 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub const fn new() -> Self {
-        Self { vec: Vec::new() }
+        Self {
+            arr: [0; N],
+            len: 0,
+        }
     }
 
     /// Decodes a UTF-16–encoded slice `v` into a `String`, returning [`Err`]
@@ -71,12 +72,12 @@ impl<const N: usize> String<N> {
     ///
     /// // 𝄞music
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0x0069, 0x0063];
-    /// let s: String<10> = String::from_utf16(v).unwrap();
+    /// let s: String<14> = String::from_utf16(v).unwrap();
     /// assert_eq!(s, "𝄞music");
     ///
     /// // 𝄞mu<invalid>ic
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0xD800, 0x0069, 0x0063];
-    /// assert!(String::<10>::from_utf16(v).is_err());
+    /// assert!(String::<14>::from_utf16(v).is_err());
     /// ```
     #[inline]
     pub fn from_utf16(v: &[u16]) -> Result<Self, FromUtf16Error> {
@@ -128,8 +129,24 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn from_utf8(vec: Vec<u8, N>) -> Result<Self, Utf8Error> {
+        /*
         core::str::from_utf8(&vec)?;
-        Ok(Self { vec })
+        let mut return_arr: [u8; N] = [0; N];
+        let length = vec.len();
+
+        for (i, byte) in vec.into_iter().enumerate() {
+            return_arr[i] = byte;
+        }
+
+        Ok(Self {
+            arr: return_arr, 
+            len: length 
+        })
+        */
+        
+
+        let string: String<N> = core::str::from_utf8(&vec)?.try_into().unwrap();
+        Ok(string)
     }
 
     /// Convert UTF-8 bytes into a `String`, without checking that the string
@@ -155,7 +172,10 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub unsafe fn from_utf8_unchecked(vec: Vec<u8, N>) -> Self {
-        Self { vec }
+        Self {
+            arr: vec[..].try_into().unwrap_unchecked(),
+            len: vec.len(),
+        }
     }
 
     /// Converts a `String` into a byte vector.
@@ -178,7 +198,7 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn into_bytes(self) -> Vec<u8, N> {
-        self.vec
+        self.arr[..self.len].try_into().unwrap()
     }
 
     /// Extracts a string slice containing the entire string.
@@ -199,7 +219,7 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn as_str(&self) -> &str {
-        unsafe { str::from_utf8_unchecked(self.vec.as_slice()) }
+        unsafe { str::from_utf8_unchecked(&self.arr[..self.len]) }
     }
 
     /// Converts a `String` into a mutable string slice.
@@ -218,38 +238,7 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn as_mut_str(&mut self) -> &mut str {
-        unsafe { str::from_utf8_unchecked_mut(self.vec.as_mut_slice()) }
-    }
-
-    /// Returns a mutable reference to the contents of this `String`.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it does not check that the bytes passed
-    /// to it are valid UTF-8. If this constraint is violated, it may cause
-    /// memory unsafety issues with future users of the `String`, as the rest of
-    /// the library assumes that `String`s are valid UTF-8.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    ///
-    /// ```
-    /// use heapless::String;
-    ///
-    /// let mut s: String<8> = String::try_from("hello")?;
-    ///
-    /// unsafe {
-    ///     let vec = s.as_mut_vec();
-    ///     assert_eq!(&[104, 101, 108, 108, 111][..], &vec[..]);
-    ///
-    ///     vec.reverse();
-    /// }
-    /// assert_eq!(s, "olleh");
-    /// # Ok::<(), ()>(())
-    /// ```
-    pub unsafe fn as_mut_vec(&mut self) -> &mut Vec<u8, N> {
-        &mut self.vec
+        unsafe { str::from_utf8_unchecked_mut(&mut self.arr[..self.len]) }
     }
 
     /// Appends a given string slice onto the end of this `String`.
@@ -273,7 +262,18 @@ impl<const N: usize> String<N> {
     #[inline]
     #[allow(clippy::result_unit_err)]
     pub fn push_str(&mut self, string: &str) -> Result<(), ()> {
-        self.vec.extend_from_slice(string.as_bytes())
+        let string_length = string.len();
+        // If we are going to overflow.
+        if self.len + string_length > N {
+            return Err(())
+        }
+
+        for (i, c) in string.as_bytes().into_iter().enumerate() {
+            self.arr[i + self.len] = *c; 
+        }
+        self.len += string_length; 
+
+        Ok(())
     }
 
     /// Returns the maximum number of elements the String can hold.
@@ -290,7 +290,7 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.vec.capacity()
+        N
     }
 
     /// Appends the given [`char`] to the end of this `String`.
@@ -316,79 +316,23 @@ impl<const N: usize> String<N> {
     #[inline]
     #[allow(clippy::result_unit_err)]
     pub fn push(&mut self, c: char) -> Result<(), ()> {
-        match c.len_utf8() {
-            1 => self.vec.push(c as u8).map_err(|_| {}),
-            _ => self
-                .vec
-                .extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        let char_length = c.len_utf8();
+
+        if self.len + char_length > N {
+            return Err(());
         }
-    }
 
-    /// Shortens this `String` to the specified length.
-    ///
-    /// If `new_len` is greater than the string's current length, this has no
-    /// effect.
-    ///
-    /// Note that this method has no effect on the allocated capacity
-    /// of the string
-    ///
-    /// # Panics
-    ///
-    /// Panics if `new_len` does not lie on a [`char`] boundary.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    ///
-    /// ```
-    /// use heapless::String;
-    ///
-    /// let mut s: String<8> = String::try_from("hello")?;
-    ///
-    /// s.truncate(2);
-    ///
-    /// assert_eq!("he", s);
-    /// # Ok::<(), ()>(())
-    /// ```
-    #[inline]
-    pub fn truncate(&mut self, new_len: usize) {
-        if new_len <= self.len() {
-            assert!(self.is_char_boundary(new_len));
-            self.vec.truncate(new_len)
-        }
-    }
-
-    /// Removes the last character from the string buffer and returns it.
-    ///
-    /// Returns [`None`] if this `String` is empty.
-    ///
-    /// # Examples
-    ///
-    /// Basic usage:
-    ///
-    /// ```
-    /// use heapless::String;
-    ///
-    /// let mut s: String<8> = String::try_from("foo")?;
-    ///
-    /// assert_eq!(s.pop(), Some('o'));
-    /// assert_eq!(s.pop(), Some('o'));
-    /// assert_eq!(s.pop(), Some('f'));
-    ///
-    /// assert_eq!(s.pop(), None);
-    /// Ok::<(), ()>(())
-    /// ```
-    pub fn pop(&mut self) -> Option<char> {
-        let ch = self.chars().next_back()?;
-
-        // pop bytes that correspond to `ch`
-        for _ in 0..ch.len_utf8() {
-            unsafe {
-                self.vec.pop_unchecked();
+        match char_length {
+            1 => {
+                self.arr[self.len] = c.try_into().map_err(|_| ())?; 
+                self.len += 1;
+                Ok(())
+            }
+            _ => {
+                self.push_str(c.encode_utf8(&mut [0; 4]))?;
+                Ok(())
             }
         }
-
-        Some(ch)
     }
 
     /// Removes a [`char`] from this `String` at a byte position and returns it.
@@ -423,12 +367,78 @@ impl<const N: usize> String<N> {
 
         let next = index + ch.len_utf8();
         let len = self.len();
-        let ptr = self.vec.as_mut_ptr();
+        let ptr = self.arr.as_mut_ptr();
         unsafe {
             core::ptr::copy(ptr.add(next), ptr.add(index), len - next);
-            self.vec.set_len(len - (next - index));
+            self.len = len - (next - index);
         }
         ch
+    }
+
+    /// Shortens this `String` to the specified length.
+    ///
+    /// If `new_len` is greater than the string's current length, this has no
+    /// effect.
+    ///
+    /// Note that this method has no effect on the allocated capacity
+    /// of the string
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_len` does not lie on a [`char`] boundary.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use heapless::String;
+    ///
+    /// let mut s: String<8> = String::try_from("hello")?;
+    ///
+    /// s.truncate(2);
+    ///
+    /// assert_eq!("he", s);
+    /// # Ok::<(), ()>(())
+    /// ```
+    #[inline]
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len <= self.len() {
+            assert!(self.is_char_boundary(new_len));
+            self.len = new_len
+        }
+    }
+
+    /// Removes the last character from the string buffer and returns it.
+    ///
+    /// Returns [`None`] if this `String` is empty.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use heapless::String;
+    ///
+    /// let mut s: String<8> = String::try_from("foo")?;
+    ///
+    /// assert_eq!(s.pop(), Some('o'));
+    /// assert_eq!(s.pop(), Some('o'));
+    /// assert_eq!(s.pop(), Some('f'));
+    ///
+    /// assert_eq!(s.pop(), None);
+    /// Ok::<(), ()>(())
+    /// ```
+    pub fn pop(&mut self) -> Option<char> {
+        if self.len == 0 {
+            return None;
+        }
+
+        // pop bytes that correspond to `ch`
+        let ch = self.chars().next_back()?;
+        let char_length = ch.len_utf8();
+        self.len -= char_length;
+        Some(ch)
     }
 
     /// Truncates this `String`, removing all contents.
@@ -454,7 +464,7 @@ impl<const N: usize> String<N> {
     /// ```
     #[inline]
     pub fn clear(&mut self) {
-        self.vec.clear()
+        self.len = 0;
     }
 }
 
@@ -516,7 +526,8 @@ impl<'a, const N: usize> iter::FromIterator<&'a str> for String<N> {
 impl<const N: usize> Clone for String<N> {
     fn clone(&self) -> Self {
         Self {
-            vec: self.vec.clone(),
+            arr: self.arr.clone(),
+            len: self.len.clone(),
         }
     }
 }
@@ -909,6 +920,7 @@ mod tests {
     #[test]
     fn pop() {
         let mut s: String<8> = String::try_from("foo").unwrap();
+        println!("S LENGTH: {}", s.len());
         assert_eq!(s.pop(), Some('o'));
         assert_eq!(s.pop(), Some('o'));
         assert_eq!(s.pop(), Some('f'));
@@ -919,6 +931,7 @@ mod tests {
     fn pop_uenc() {
         let mut s: String<8> = String::try_from("é").unwrap();
         assert_eq!(s.len(), 3);
+        println!("S: {s}");
         match s.pop() {
             Some(c) => {
                 assert_eq!(s.len(), 1);
